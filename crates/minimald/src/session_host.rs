@@ -29,18 +29,8 @@ use crate::session_delta::DeltaSource;
 use crate::sessions::SessionControl;
 #[cfg(not(test))]
 use sessions::NetworkMode;
+use sessions::keys::{CommandMode, KeyAction, SessionKeys};
 use std::sync::Arc;
-
-/// Command sequence for the ctrl-w key chord, when the kitty keyboard protocol
-/// is negotiated.
-///
-/// Corresponds to: Kitty: CSI 119 ; 5 u
-const CTRL_W_CSI_U: &[u8] = b"\x1b[119;5u";
-/// Command sequence for the ctrl-w key chord, when the modifyOtherKeys key
-/// sequences are used by the outer terminal.
-///
-/// Corrsponds to: modifyOtherKeys: CSI 27 ; 5 ; 119 ~
-const CTRL_W_CSI_27: &[u8] = b"\x1b[27;5;119~";
 
 /// Header of the prompt shown over the channel when a session's shell process
 /// exits, offering to detach or delete. Exposed so tests can await its
@@ -499,7 +489,7 @@ impl Binding {
                         }
                         BindingMsg::TeardownDueToDetach(unwind_codes) => {
                             let _ = w.write_all(&unwind_codes).await;
-                            let _ = w.write_all(b"\r\nDetaching due to ctrl-w.\r\n").await;
+                            let _ = w.write_all(b"\r\nDetaching from session.\r\n").await;
                             break MainloopExitReason::Detach;
                         }
                     };
@@ -812,7 +802,7 @@ pub(crate) struct Launched<P, G> {
 /// Actor messages to a [`Host`].
 enum Message {
     Kill(bool),
-    Attach(Channel<Msg>, WinSize),
+    Attach(Channel<Msg>, WinSize, SessionKeys),
     GetAttrs(oneshot::Sender<HostAttrs>),
     /// Compute the workspace's at-risk report (VCS-exact when the tree is a
     /// git repository, the changed-since-activation delta otherwise) and
@@ -977,10 +967,11 @@ impl HostHandle {
         &self,
         c: Channel<Msg>,
         sz: WinSize,
+        keys: SessionKeys,
     ) -> Result<(), (Channel<Msg>, WinSize)> {
-        match self.sender.send(Message::Attach(c, sz)).await {
+        match self.sender.send(Message::Attach(c, sz, keys)).await {
             Ok(()) => Ok(()),
-            Err(SendError(Message::Attach(c, sz))) => Err((c, sz)),
+            Err(SendError(Message::Attach(c, sz, _))) => Err((c, sz)),
             Err(e) => unreachable!("{:?}", e),
         }
     }
@@ -1159,6 +1150,18 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     // to each binding alongside `delta`.
     archives_dir: std::path::PathBuf,
 
+    // The negotiated per-channel session keys: the leader chord that enters
+    // command mode, the detach/forward subcommand keys, and the bell flag.
+    // Refreshed from the channel's env vars on every attach (so two clients
+    // with different configs on the same session each get their own chord);
+    // defaults to `ctrl-]` / `d` when a client sends no keys.
+    session_keys: SessionKeys,
+
+    // Per-channel command-mode state for the session-key state machine: idle
+    // (keystrokes forward) or awaiting the subcommand that follows a
+    // swallowed leader. Reset to idle on every attach.
+    command_mode: CommandMode,
+
     // Keeps launcher-owned resources (the session's `Env`, which owns the
     // sandbox files backing the running process's rootfs along with the context
     // and graph) alive for as long as this host (and thus the session process)
@@ -1285,7 +1288,7 @@ const SESSION_WORKSPACE_ROOT: &str = constcat::concat!("/", sandbox2::SESSION_DE
 /// and attaches from unrelated host directories. TTY-gated, plain text —
 /// `NO_COLOR`-safe, no box drawing.
 const BASELINE_MOTD: &str = constcat::concat!(
-    r#"[ -t 1 ] && { printf 'minimal · session %s · loadout %s\ndetach: ctrl-w' "${MINIMAL_SESSION_NAME:-unnamed}" "${MINIMAL_LOADOUTS:-none}"; [ -f "#,
+    r#"[ -t 1 ] && { printf 'minimal · session %s · loadout %s\ndetach: %s' "${MINIMAL_SESSION_NAME:-unnamed}" "${MINIMAL_LOADOUTS:-none}" "${MINIMAL_DETACH_HINT:-ctrl-] then d}"; [ -f "#,
     SESSION_WORKSPACE_ROOT,
     r#"/minimal.toml ] || [ -f "#,
     SESSION_WORKSPACE_ROOT,
@@ -1963,11 +1966,16 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             workspace_root,
             session_name,
             archives_dir,
+            session_keys: SessionKeys::default(),
+            command_mode: CommandMode::Idle,
             guard,
         };
 
         if let Some(channel) = channel {
-            host.attach(channel, sz, true).await;
+            // `build`'s own caller never supplies a channel today (the session
+            // attach path spawns with `None` and attaches via `HostHandle`),
+            // so the default keys apply only on this direct-attach path.
+            host.attach(channel, sz, true, SessionKeys::default()).await;
         }
 
         Ok((host, handle))
@@ -2084,8 +2092,8 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                         // `mainloop` reap via `wait()` and return.
                         return Err(());
                     }
-                    Message::Attach(channel, sz) => {
-                        self.attach(channel, sz, false).await;
+                    Message::Attach(channel, sz, keys) => {
+                        self.attach(channel, sz, false, keys).await;
                     }
                     Message::SetTitleCallback(title) => {
                         self.attrs.title = Some((title, SystemTime::now()));
@@ -2170,25 +2178,56 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                     StdinMsg::Bytes(b) => {
                         self.attrs.stdin_last = Some(SystemTime::now());
 
-                        // ctrl-w
-                        let is_detach = b.len() == 1 && b[0] == 0x17 ||
-                            b == CTRL_W_CSI_U ||
-                            b == CTRL_W_CSI_27;
-
-                        if is_detach {
-                            let uc = self.unwind_codes();
-                            if let Some((tx, _hnd)) = self.remote.as_mut() {
-                                match tx.send(BindingMsg::TeardownDueToDetach(uc)).await {
-                                    Ok(()) => {},
-                                    Err(e) => {
-                                        tracing::warn!("failed sending detach signal to remote: {e}");
-                                    }
-                                };
-                                self.remote = None;
+                        // Session-key command-mode state machine: the leader
+                        // chord is swallowed and enters command mode; the next
+                        // keystroke is the subcommand — detach, forward, or an
+                        // unbound key that cancels. The leader is never
+                        // forwarded except via the explicit forward subcommand.
+                        let (next_mode, action) =
+                            self.session_keys.advance(self.command_mode, &b);
+                        match action {
+                            KeyAction::Forward => {
+                                self.stdin_buf = Some((b, 0));
                             }
-                        } else {
-                            self.stdin_buf = Some((b, 0));
-                        };
+                            KeyAction::Swallow => {}
+                            KeyAction::EnterCommandMode => {
+                                // Ring the terminal bell on the channel back to
+                                // the user (never the PTY, so the app never
+                                // sees it) when the client opted in.
+                                if self.session_keys.bell_on_leader
+                                    && let Some((tx, _)) = self.remote.as_ref()
+                                {
+                                    let _ = tx.send(BindingMsg::Stdin(vec![0x07])).await;
+                                }
+                            }
+                            KeyAction::Detach => {
+                                let uc = self.unwind_codes();
+                                if let Some((tx, _hnd)) = self.remote.as_mut() {
+                                    match tx.send(BindingMsg::TeardownDueToDetach(uc)).await {
+                                        Ok(()) => {},
+                                        Err(e) => {
+                                            tracing::warn!("failed sending detach signal to remote: {e}");
+                                        }
+                                    };
+                                    self.remote = None;
+                                }
+                            }
+                            KeyAction::ForwardLeader => {
+                                // Verbatim-forward a leader byte down the PTY
+                                // and exit command mode, handing the next
+                                // keystroke to the layer below (a nested daemon,
+                                // if any). Safe to over-send: a stray leader
+                                // past the deepest layer hits the app's own
+                                // non-destructive leader binding.
+                                self.stdin_buf = Some((
+                                    bytes::Bytes::from(vec![
+                                        self.session_keys.leader.plain_byte(),
+                                    ]),
+                                    0,
+                                ));
+                            }
+                        }
+                        self.command_mode = next_mode;
                     }
                     StdinMsg::TerminalUpdate(sz) => {
                         self.set_size(WinSize::from(&sz));
@@ -2241,7 +2280,20 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         Ok(())
     }
 
-    async fn attach(&mut self, channel: Channel<Msg>, sz: WinSize, skip_flush: bool) {
+    async fn attach(
+        &mut self,
+        channel: Channel<Msg>,
+        sz: WinSize,
+        skip_flush: bool,
+        keys: SessionKeys,
+    ) {
+        // A new channel means a fresh key negotiation and a fresh command-mode
+        // state: two clients with different configs on the same session each
+        // get their own chord, and a reattach never inherits a stale
+        // awaiting-subcommand state.
+        self.session_keys = keys;
+        self.command_mode = CommandMode::Idle;
+
         if !skip_flush {
             self.parser.screen_mut().set_size(sz.rows, sz.cols);
             let _ = channel
@@ -2418,6 +2470,10 @@ mod tests {
         // Static template, dynamic vars: interpolated in-shell, unset-safe.
         assert!(motd.contains("${MINIMAL_SESSION_NAME:-"));
         assert!(motd.contains("${MINIMAL_LOADOUTS:-"));
+        // The detach hint is a third %s filled by the negotiated keys var,
+        // with the default chord as the unset fallback.
+        assert!(motd.contains("detach: %s"));
+        assert!(motd.contains("${MINIMAL_DETACH_HINT:-ctrl-] then d}"));
         // The blueprint clause tests the session workspace itself at
         // print time — both mfile layouts — pinned to the same constant
         // that is the shell's initial cwd.
@@ -2427,8 +2483,29 @@ mod tests {
             !motd.contains("MINIMAL_BLUEPRINT"),
             "blueprint is a session-filesystem fact, not an env var"
         );
-        assert!(motd.contains("detach: ctrl-w"));
         assert!(motd.contains("min init"));
+    }
+
+    /// The detach hint in the orientation banner reflects the negotiated
+    /// session keys: when the connection layer seeds `MINIMAL_DETACH_HINT`
+    /// (the daemon does this from the channel's key env vars at attach), the
+    /// layered env carries it so the banner's `${MINIMAL_DETACH_HINT:-…}`
+    /// renders the actual chord rather than the default fallback.
+    #[test]
+    fn connection_layer_seeds_negotiated_detach_hint() {
+        let env = layer_session_env(
+            session_baseline_env("box-1", None),
+            vec![],
+            vec![],
+            vec![(
+                "MINIMAL_DETACH_HINT".to_string(),
+                "ctrl-^ then x".to_string(),
+            )],
+        );
+        assert_eq!(
+            env.get("MINIMAL_DETACH_HINT").map(String::as_str),
+            Some("ctrl-^ then x"),
+        );
     }
 
     /// A missing loadout display (old client / no composition) leaves
@@ -2772,10 +2849,11 @@ mod tests {
         );
     }
 
-    /// The other half of "detach != exit": a ctrl-w (detach) keystroke is
-    /// swallowed as a detach signal — never forwarded to the shell — and does not
-    /// end the session or release the network. The shell keeps running (a later
-    /// line still round-trips) and only an explicit kill/exit releases the network.
+    /// The other half of "detach != exit": the detach chord (leader then `d`)
+    /// is swallowed as a detach signal — never forwarded to the shell — and does
+    /// not end the session or release the network. The shell keeps running (a
+    /// later line still round-trips) and only an explicit kill/exit releases the
+    /// network.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn detach_keystroke_holds_the_session_and_network() {
         let torn_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2796,16 +2874,24 @@ mod tests {
         let stdin = host.remote_tx.clone();
         let task = tokio::spawn(host.mainloop());
 
-        // A bare ctrl-w (0x17) is the detach chord. It must be consumed as a
-        // detach signal rather than written to the pty.
+        // The default detach chord is `ctrl-]` (0x1d, the leader) then `d`.
+        // Both bytes are consumed by the command-mode state machine rather
+        // than written to the pty: the leader enters command mode, `d`
+        // detaches. (The host is built without a binding, so the detach is a
+        // no-op on the channel — what matters is that neither byte reaches
+        // the shell.)
         stdin
-            .send(StdinMsg::Bytes(bytes::Bytes::from(vec![0x17])))
+            .send(StdinMsg::Bytes(bytes::Bytes::from(vec![0x1d])))
             .await
-            .expect("failed to send ctrl-w");
+            .expect("failed to send leader");
+        stdin
+            .send(StdinMsg::Bytes(bytes::Bytes::from(b"d".to_vec())))
+            .await
+            .expect("failed to send detach key");
 
         // The shell survived the detach: a normal line still echoes back, which
-        // stamps stdout activity. (If ctrl-w had been forwarded or had killed the
-        // process, no echo would ever arrive.)
+        // stamps stdout activity. (If the chord had been forwarded or had killed
+        // the process, no echo would ever arrive.)
         stdin
             .send(StdinMsg::Bytes(bytes::Bytes::from(b"ping\n".to_vec())))
             .await

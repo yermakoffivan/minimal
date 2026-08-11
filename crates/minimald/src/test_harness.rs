@@ -285,11 +285,27 @@ impl TestClient {
         &mut self,
         session_id: SessionId,
     ) -> russh::Channel<russh::client::Msg> {
+        self.open_shell_with_keys(session_id, &[]).await
+    }
+
+    /// Like [`Self::open_shell`], but also sets session-key env vars on the
+    /// channel — mirroring a `min` client that negotiated a remapped leader
+    /// chord. Each `(name, value)` pair is sent via `set_env` before the PTY
+    /// and shell requests, so the daemon parses them from the channel's env
+    /// vars at attach.
+    pub async fn open_shell_with_keys(
+        &mut self,
+        session_id: SessionId,
+        keys: &[(&str, &str)],
+    ) -> russh::Channel<russh::client::Msg> {
         let channel = self.handle.channel_open_session().await.unwrap();
         channel
             .set_env(true, crate::MINIMAL_SESSION_ID_ENV, session_id.to_string())
             .await
             .unwrap();
+        for (name, value) in keys {
+            channel.set_env(true, *name, *value).await.unwrap();
+        }
         channel
             .request_pty(true, "xterm", 80, 24, 0, 0, &[])
             .await
