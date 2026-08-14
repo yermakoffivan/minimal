@@ -11,9 +11,13 @@ development sessions. Most commands start the daemon automatically when it
 isn't running, with `bug`, `stop`, and `version` being the exceptions. The 
 daemon starts natively on Linux (and under `--provider local-minvmd`) or 
 inside the [`minvmd`](./cli-minvmd.md) microVM host daemon on macOS. 
-Running bare `min` with no subcommand prints this help and exits; use
-`min session attach` to get into a session for the current directory, or
-`min session activate` to create one.
+Running bare `min` with no subcommand routes you into a session when stdin
+and stdout are both a terminal: it follows the smart-resolution rules of
+`min session attach` with no argument (cwd match → attach, only session →
+attach, ambiguity → picker), and when no sessions exist it creates one from
+the current directory and attaches. Without a terminal it instead prints a
+read-only state report on stderr and exits successfully. Use `min --help` to print this
+help.
 
 Commands are spelled `min <noun> <verb>`, and every noun accepts its singular
 and plural form (`session`/`sessions`, `loadout`/`loadouts`). A handful of
@@ -91,6 +95,7 @@ the current directory).
 | `--sync <MODE>` | | How to load project files into the session: `tarball` (default: stream a tarball of your project and unpack it) or `none` (do not populate the worktree) |
 | `--loadout <NAME>` | | Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`. Repeatable; if given, config-file `default_loadouts` are ignored |
 | `--no-loadouts` | | Apply no loadouts at all (also skips the config's `default_loadouts`). Conflicts with `--loadout` |
+| `--no-hooks` | | Run none of the session's [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points), from either the loadouts or the project's `minimal.toml`. Recorded on the session, so it applies to the later attach, detach, and destroy transitions too |
 | `--no-prompt` | | Fail instead of prompting when the daemon surfaces items user policy can't auto-decide; implied when stdin/stderr isn't a TTY |
 | `--attach` | | Automatically attach after creation |
 
@@ -131,6 +136,29 @@ min session policy <SESSION>
 Prints the effective networking policy for `SESSION` (a UUID or session
 name) as JSON — an object with `egress` and `ingress` fields, each null
 when unset. Resolved from the daemon.
+
+### `session hooks`
+
+```
+min session hooks <SESSION> [--json]
+```
+
+Lists the [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points)
+composed into `SESSION` (a UUID or session name), one row per script, with
+the transition it runs on, whether it is inline or external, its timeout, and
+the loadout or project that declared it.
+
+This shows what will actually run, not what was asked for: the daemon answers
+from the session's composition, which holds only the hooks that survived your
+[user policy](./user-policy.md). A session activated with `--no-hooks`, or one
+whose project you never allow-listed, lists nothing.
+
+Rows are in setup order — the project first, then loadouts in the order they
+were applied; teardown runs the reverse. Inline bodies are collapsed to their
+first line; `--json` emits the full records.
+
+Answered from the persisted composition, so it works after a daemon restart
+and for a session nobody is attached to.
 
 ### `stop`
 
